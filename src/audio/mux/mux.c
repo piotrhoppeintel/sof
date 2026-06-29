@@ -290,8 +290,12 @@ static int demux_process(struct processing_module *mod,
 
 		look_up = get_lookup_table(dev, cd, pipeline_id);
 		demux_prepare_active_look_up(cd, sink, source, look_up);
-		cd->demux(dev, sink, source, source_data, source_start,
-			  source_size, frames, &cd->active_lookup);
+		ret = cd->demux(dev, sink, source, source_data, source_start,
+				source_size, frames, &cd->active_lookup);
+		if (ret) {
+			source_release_data(source, 0);
+			return ret;
+		}
 	}
 
 	/* consume the processed data from the source */

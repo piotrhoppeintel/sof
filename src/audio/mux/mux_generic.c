@@ -92,7 +92,7 @@ static void mux_init_look_up_pointers_s16(struct audio_stream *sink,
 	}
 }
 
-static void demux_s16le(struct comp_dev *dev, struct sof_sink *sink,
+static int demux_s16le(struct comp_dev *dev, struct sof_sink *sink,
 			struct sof_source *source, const void *source_data,
 			const void *source_start, size_t source_size,
 			uint32_t frames, struct mux_look_up *lookup)
@@ -111,12 +111,12 @@ static void demux_s16le(struct comp_dev *dev, struct sof_sink *sink,
 	comp_dbg(dev, "entry");
 
 	if (!lookup || !lookup->num_elems)
-		return;
+		return 0;
 
 	/* obtain the sink circular buffer for this output stream */
 	ret = sink_get_buffer_s16(sink, bytes, &y, &y_start, &y_size);
 	if (ret)
-		return;
+		return ret;
 
 	y_end = y_start + y_size;
 
@@ -171,6 +171,8 @@ static void demux_s16le(struct comp_dev *dev, struct sof_sink *sink,
 	}
 
 	sink_commit_buffer(sink, bytes);
+
+	return 0;
 }
 
 /**
@@ -293,8 +295,9 @@ static void mux_init_look_up_pointers_s32(struct audio_stream *sink,
  * @param[in] source_size Size of the source circular buffer in bytes.
  * @param[in] frames Number of frames to process.
  * @param[in] lookup mux look up table.
+ * @return 0 on success, negative error code otherwise.
  */
-static void demux_s32le(struct comp_dev *dev, struct sof_sink *sink,
+static int demux_s32le(struct comp_dev *dev, struct sof_sink *sink,
 			struct sof_source *source, const void *source_data,
 			const void *source_start, size_t source_size,
 			uint32_t frames, struct mux_look_up *lookup)
@@ -313,12 +316,12 @@ static void demux_s32le(struct comp_dev *dev, struct sof_sink *sink,
 	comp_dbg(dev, "entry");
 
 	if (!lookup || !lookup->num_elems)
-		return;
+		return 0;
 
 	/* obtain the sink circular buffer for this output stream */
 	ret = sink_get_buffer_s32(sink, bytes, &y, &y_start, &y_size);
 	if (ret)
-		return;
+		return ret;
 
 	y_end = y_start + y_size;
 
@@ -373,6 +376,8 @@ static void demux_s32le(struct comp_dev *dev, struct sof_sink *sink,
 	}
 
 	sink_commit_buffer(sink, bytes);
+
+	return 0;
 }
 
 /**
