@@ -135,8 +135,10 @@ static int demux_s16le(struct comp_dev *dev, struct sof_sink *sink,
 			lookup->copy_elem[0].in_ch;
 		int16_t *dst = (int16_t *)lookup->copy_elem[0].dest -
 			lookup->copy_elem[0].out_ch;
-		uint32_t source_frames_without_wrap = (x_end - src) / source_channels;
-		uint32_t sink_frames_without_wrap = (y_end - dst) / sink_channels;
+		uint32_t source_frames_without_wrap =
+			circ_buf_frames_without_wrap(src, x_end, sizeof(*src), source_channels);
+		uint32_t sink_frames_without_wrap =
+			circ_buf_frames_without_wrap(dst, y_end, sizeof(*dst), sink_channels);
 		uint32_t frames_without_wrap;
 
 		frames_without_wrap = MIN(source_frames_without_wrap,
@@ -340,8 +342,10 @@ static int demux_s32le(struct comp_dev *dev, struct sof_sink *sink,
 			lookup->copy_elem[0].in_ch;
 		int32_t *dst = (int32_t *)lookup->copy_elem[0].dest -
 			lookup->copy_elem[0].out_ch;
-		uint32_t source_frames_without_wrap = (x_end - src) / source_channels;
-		uint32_t sink_frames_without_wrap = (y_end - dst) / sink_channels;
+		uint32_t source_frames_without_wrap =
+			circ_buf_frames_without_wrap(src, x_end, sizeof(*src), source_channels);
+		uint32_t sink_frames_without_wrap =
+			circ_buf_frames_without_wrap(dst, y_end, sizeof(*dst), sink_channels);
 		uint32_t frames_without_wrap;
 
 		frames_without_wrap = MIN(source_frames_without_wrap,
