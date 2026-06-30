@@ -251,9 +251,7 @@ static int demux_process(struct processing_module *mod,
 	 */
 	frames = source_get_data_frames_available(source);
 	for (i = 0; i < num_of_sinks; i++) {
-		struct comp_buffer *sink_buf = comp_buffer_get_from_sink(sinks[i]);
-
-		if (comp_buffer_get_sink_state(sink_buf) != dev->state)
+		if (sink_get_state(sinks[i]) != dev->state)
 			continue;
 
 		frames = MIN(frames, sink_get_free_frames(sinks[i]));
@@ -274,12 +272,11 @@ static int demux_process(struct processing_module *mod,
 	/* produce output, one sink at a time */
 	for (i = 0; i < num_of_sinks; i++) {
 		struct sof_sink *sink = sinks[i];
-		struct comp_buffer *sink_buf = comp_buffer_get_from_sink(sink);
-		uint32_t pipeline_id = buffer_pipeline_id(sink_buf);
+		uint32_t pipeline_id = sink_get_pipeline_id(sink);
 		struct mux_look_up *look_up;
 
 		/* skip sinks that are not in the same state as the component */
-		if (comp_buffer_get_sink_state(sink_buf) != dev->state)
+		if (sink_get_state(sink) != dev->state)
 			continue;
 
 		/* return if configuration for this pipeline is missing */
