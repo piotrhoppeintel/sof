@@ -203,8 +203,8 @@ static struct mux_look_up *get_lookup_table(struct comp_dev *dev, struct comp_da
 }
 
 static void demux_prepare_active_look_up(struct comp_data *cd,
-					 struct audio_stream *sink,
-					 const struct audio_stream *source,
+					 struct sof_sink *sink,
+					 struct sof_source *source,
 					 struct mux_look_up *look_up)
 {
 	int elem;
@@ -212,8 +212,8 @@ static void demux_prepare_active_look_up(struct comp_data *cd,
 
 	/* init pointers */
 	for (elem = 0; elem < look_up->num_elems; elem++) {
-		if (look_up->copy_elem[elem].in_ch >= audio_stream_get_channels(source) ||
-		    look_up->copy_elem[elem].out_ch >= audio_stream_get_channels(sink))
+		if (look_up->copy_elem[elem].in_ch >= source_get_channels(source) ||
+		    look_up->copy_elem[elem].out_ch >= sink_get_channels(sink))
 			continue;
 
 		cd->active_lookup.copy_elem[active_elem] = look_up->copy_elem[elem];
@@ -225,56 +225,78 @@ static void demux_prepare_active_look_up(struct comp_data *cd,
 
 /* process and copy stream data from source to sink buffers */
 static int demux_process(struct processing_module *mod,
-			 struct input_stream_buffer *input_buffers, int num_input_buffers,
-			 struct output_stream_buffer *output_buffers, int num_output_buffers)
+			 struct sof_source **sources, int num_of_sources,
+			 struct sof_sink **sinks, int num_of_sinks)
 {
 	struct comp_data *cd = module_get_private_data(mod);
 	struct comp_dev *dev = mod->dev;
-	struct comp_buffer *sink;
-	struct audio_stream *sinks_stream[MUX_MAX_STREAMS] = { NULL };
-	struct mux_look_up *look_ups[MUX_MAX_STREAMS] = { NULL };
-	int frames;
-	int sink_bytes;
-	int source_bytes;
+	struct sof_source *source = sources[0];
+	const void *source_data;
+	const void *source_start;
+	size_t source_size;
+	size_t source_bytes;
+	uint32_t frames;
+	int ret;
 	int i;
 
 	comp_dbg(dev, "entry");
 
-	/* align sink streams with their respective configurations */
-	comp_dev_for_each_consumer(dev, sink) {
-		if (comp_buffer_get_sink_state(sink) == dev->state) {
-			i = get_stream_index(dev, cd, buffer_pipeline_id(sink));
-			/* return if index wrong */
-			if (i < 0) {
-				return i;
-			}
-
-			look_ups[i] = get_lookup_table(dev, cd, buffer_pipeline_id(sink));
-			sinks_stream[i] = &sink->stream;
-		}
-	}
-
-	/* if there are no sinks active, then sinks[] is also empty */
-	if (num_output_buffers == 0)
+	/* if there are no sinks active, then there is nothing to do */
+	if (num_of_sinks == 0)
 		return 0;
 
-	frames = input_buffers[0].size;
-	source_bytes = frames * audio_stream_frame_bytes(mod->input_buffers[0].data);
-	sink_bytes = frames * audio_stream_frame_bytes(mod->output_buffers[0].data);
+	/* the same number of frames is distributed to every sink, so it is
+	 * limited by both the source availability and every active sink's free
+	 * space
+	 */
+	frames = source_get_data_frames_available(source);
+	for (i = 0; i < num_of_sinks; i++) {
+		if (sink_get_state(sinks[i]) != dev->state)
+			continue;
 
-	/* produce output, one sink at a time */
-	for (i = 0; i < num_output_buffers; i++) {
-		if (sinks_stream[i]) {
-			demux_prepare_active_look_up(cd, sinks_stream[i],
-						     input_buffers[0].data, look_ups[i]);
-			cd->demux(dev, sinks_stream[i], input_buffers[0].data,
-				  frames, &cd->active_lookup);
-		}
-		mod->output_buffers[i].size = sink_bytes;
+		frames = MIN(frames, sink_get_free_frames(sinks[i]));
 	}
 
-	/* Update consumed */
-	mod->input_buffers[0].consumed = source_bytes;
+	if (!frames)
+		return 0;
+
+	/* the source is read-only and shared by all sinks, so it is obtained
+	 * once here and released once after all sinks have been served
+	 */
+	source_bytes = frames * source_get_frame_bytes(source);
+	ret = source_get_data(source, source_bytes, &source_data, &source_start,
+			      &source_size);
+	if (ret)
+		return ret;
+
+	/* produce output, one sink at a time */
+	for (i = 0; i < num_of_sinks; i++) {
+		struct sof_sink *sink = sinks[i];
+		uint32_t pipeline_id = sink_get_pipeline_id(sink);
+		struct mux_look_up *look_up;
+
+		/* skip sinks that are not in the same state as the component */
+		if (sink_get_state(sink) != dev->state)
+			continue;
+
+		/* return if configuration for this pipeline is missing */
+		if (get_stream_index(dev, cd, pipeline_id) < 0) {
+			source_release_data(source, 0);
+			return -EINVAL;
+		}
+
+		look_up = get_lookup_table(dev, cd, pipeline_id);
+		demux_prepare_active_look_up(cd, sink, source, look_up);
+		ret = cd->demux(dev, sink, source, source_data, source_start,
+				source_size, frames, &cd->active_lookup);
+		if (ret) {
+			source_release_data(source, 0);
+			return ret;
+		}
+	}
+
+	/* consume the processed data from the source */
+	source_release_data(source, source_bytes);
 	return 0;
 }
 
@@ -454,7 +476,7 @@ static const struct module_interface demux_interface = {
 	.set_configuration = mux_set_config,
 	.get_configuration = mux_get_config,
 	.prepare = mux_prepare,
-	.process_audio_stream = demux_process,
+	.process = demux_process,
 	.trigger = demux_trigger,
 	.reset = mux_reset,
 	.free = mux_free,
