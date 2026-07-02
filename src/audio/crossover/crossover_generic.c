@@ -8,7 +8,11 @@
 #include <sof/audio/module_adapter/module/module_interface.h>
 #include <sof/audio/component.h>
 #include <sof/audio/format.h>
+#include <sof/audio/sink_api.h>
+#include <sof/audio/source_api.h>
+#include <sof/audio/sink_source_utils.h>
 #include <sof/math/iir_df1.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "crossover.h"
@@ -87,96 +91,164 @@ static void crossover_generic_split_4way(int32_t in,
 				    z2, &out[2], &out[3]);
 }
 
-static void crossover_default_pass(struct comp_data *cd,
-				   struct input_stream_buffer *bsource,
-				   struct output_stream_buffer **bsinks,
-				   int32_t num_sinks,
-				   uint32_t frames)
-{
-	const struct audio_stream *source_stream = bsource->data;
-	uint32_t samples = audio_stream_get_channels(source_stream) * frames;
-	int i;
-
-	for (i = 0; i < num_sinks; i++) {
-		if (!bsinks[i])
-			continue;
-		audio_stream_copy(source_stream, 0, bsinks[i]->data, 0, samples);
-	}
-}
-
-#if CONFIG_FORMAT_S16LE
-static void crossover_s16_default(struct comp_data *cd,
-				  struct input_stream_buffer *bsource,
-				  struct output_stream_buffer **bsinks,
+/*
+ * \brief Passthrough copy of the source samples to every assigned sink.
+ *
+ * Used when the component runs without a configuration blob. The source
+ * data are copied to each active sink without being freed (free == false)
+ * so that the same input is replicated to all sinks; the source is
+ * released once after the last copy.
+ *
+ * \return 0 on success, negative error code otherwise.
+ */
+static int crossover_default_pass(struct comp_data *cd,
+				  struct sof_source *source,
+				  struct sof_sink **sinks,
 				  int32_t num_sinks,
 				  uint32_t frames)
 {
+	size_t bytes = frames * source_get_frame_bytes(source);
+	int ret;
+	int i;
+
+	for (i = 0; i < num_sinks; i++) {
+		if (!sinks[i])
+			continue;
+		ret = source_to_sink_copy(source, sinks[i], false, bytes);
+		if (ret)
+			return ret;
+	}
+
+	return source_release_data(source, bytes);
+}
+
+#if CONFIG_FORMAT_S16LE
+static int crossover_s16_default(struct comp_data *cd,
+				 struct sof_source *source,
+				 struct sof_sink **sinks,
+				 int32_t num_sinks,
+				 uint32_t frames)
+{
+	int16_t *y[SOF_CROSSOVER_MAX_STREAMS];
+	int16_t *y_start[SOF_CROSSOVER_MAX_STREAMS];
+	int16_t *y_end[SOF_CROSSOVER_MAX_STREAMS];
+	int out_idx[SOF_CROSSOVER_MAX_STREAMS];
+	int32_t out[SOF_CROSSOVER_MAX_STREAMS];
 	struct crossover_state *state;
-	const struct audio_stream *source_stream = bsource->data;
-	struct audio_stream *sink_stream;
-	int16_t *x, *y;
+	int16_t const *x, *x_start, *x_end;
+	int x_samples, y_samples;
+	int nch = source_get_channels(source);
+	size_t bytes = frames * source_get_frame_bytes(source);
+	int active_sinks = 0;
 	int ch, i, j;
-	int idx;
-	int nch = audio_stream_get_channels(source_stream);
-	int32_t out[num_sinks];
+	int ret;
 
-	for (ch = 0; ch < nch; ch++) {
-		idx = ch;
-		state = &cd->state[ch];
-		for (i = 0; i < frames; i++) {
-			x = audio_stream_read_frag_s16(source_stream, idx);
+	ret = source_get_data_s16(source, bytes, &x, &x_start, &x_samples);
+	if (ret)
+		return ret;
+	x_end = x_start + x_samples;
+
+	for (j = 0; j < num_sinks; j++) {
+		if (!sinks[j])
+			continue;
+		ret = sink_get_buffer_s16(sinks[j], bytes, &y[active_sinks],
+					  &y_start[active_sinks], &y_samples);
+		if (ret)
+			return ret;
+		y_end[active_sinks] = y_start[active_sinks] + y_samples;
+		out_idx[active_sinks] = j;
+		active_sinks++;
+	}
+
+	for (i = 0; i < frames; i++) {
+		for (ch = 0; ch < nch; ch++) {
+			state = &cd->state[ch];
 			cd->crossover_split(*x << 16, out, state);
-
-			for (j = 0; j < num_sinks; j++) {
-				if (!bsinks[j])
-					continue;
-				sink_stream = bsinks[j]->data;
-				y = audio_stream_write_frag_s16(sink_stream,
-								idx);
-				*y = sat_int16(Q_SHIFT_RND(out[j], 31, 15));
+			if (++x >= x_end)
+				x = x_start;
+			for (j = 0; j < active_sinks; j++) {
+				*y[j] = sat_int16(Q_SHIFT_RND(out[out_idx[j]], 31, 15));
+				if (++y[j] >= y_end[j])
+					y[j] = y_start[j];
 			}
-
-			idx += nch;
 		}
 	}
+
+	ret = source_release_data(source, bytes);
+	if (ret)
+		return ret;
+	for (j = 0; j < active_sinks; j++) {
+		ret = sink_commit_buffer(sinks[out_idx[j]], bytes);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 #endif /* CONFIG_FORMAT_S16LE */
 
 #if CONFIG_FORMAT_S24LE
-static void crossover_s24_default(struct comp_data *cd,
-				  struct input_stream_buffer *bsource,
-				  struct output_stream_buffer **bsinks,
-				  int32_t num_sinks,
-				  uint32_t frames)
+static int crossover_s24_default(struct comp_data *cd,
+				 struct sof_source *source,
+				 struct sof_sink **sinks,
+				 int32_t num_sinks,
+				 uint32_t frames)
 {
+	int32_t *y[SOF_CROSSOVER_MAX_STREAMS];
+	int32_t *y_start[SOF_CROSSOVER_MAX_STREAMS];
+	int32_t *y_end[SOF_CROSSOVER_MAX_STREAMS];
+	int out_idx[SOF_CROSSOVER_MAX_STREAMS];
+	int32_t out[SOF_CROSSOVER_MAX_STREAMS];
 	struct crossover_state *state;
-	const struct audio_stream *source_stream = bsource->data;
-	struct audio_stream *sink_stream;
-	int32_t *x, *y;
+	int32_t const *x, *x_start, *x_end;
+	int x_samples, y_samples;
+	int nch = source_get_channels(source);
+	size_t bytes = frames * source_get_frame_bytes(source);
+	int active_sinks = 0;
 	int ch, i, j;
-	int idx;
-	int nch = audio_stream_get_channels(source_stream);
-	int32_t out[num_sinks];
+	int ret;
 
-	for (ch = 0; ch < nch; ch++) {
-		idx = ch;
-		state = &cd->state[ch];
-		for (i = 0; i < frames; i++) {
-			x = audio_stream_read_frag_s32(source_stream, idx);
+	ret = source_get_data_s32(source, bytes, &x, &x_start, &x_samples);
+	if (ret)
+		return ret;
+	x_end = x_start + x_samples;
+
+	for (j = 0; j < num_sinks; j++) {
+		if (!sinks[j])
+			continue;
+		ret = sink_get_buffer_s32(sinks[j], bytes, &y[active_sinks],
+					  &y_start[active_sinks], &y_samples);
+		if (ret)
+			return ret;
+		y_end[active_sinks] = y_start[active_sinks] + y_samples;
+		out_idx[active_sinks] = j;
+		active_sinks++;
+	}
+
+	for (i = 0; i < frames; i++) {
+		for (ch = 0; ch < nch; ch++) {
+			state = &cd->state[ch];
 			cd->crossover_split(*x << 8, out, state);
-
-			for (j = 0; j < num_sinks; j++) {
-				if (!bsinks[j])
-					continue;
-				sink_stream = bsinks[j]->data;
-				y = audio_stream_write_frag_s32(sink_stream,
-								idx);
-				*y = sat_int24(Q_SHIFT_RND(out[j], 31, 23));
+			if (++x >= x_end)
+				x = x_start;
+			for (j = 0; j < active_sinks; j++) {
+				*y[j] = sat_int24(Q_SHIFT_RND(out[out_idx[j]], 31, 23));
+				if (++y[j] >= y_end[j])
+					y[j] = y_start[j];
 			}
-
-			idx += nch;
 		}
 	}
+
+	ret = source_release_data(source, bytes);
+	if (ret)
+		return ret;
+	for (j = 0; j < active_sinks; j++) {
+		ret = sink_commit_buffer(sinks[out_idx[j]], bytes);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 #endif /* CONFIG_FORMAT_S24LE */
 
@@ -184,68 +256,80 @@ static void crossover_s24_default(struct comp_data *cd,
 /**
  * \brief Processes audio frames with a crossover filter for s32 format.
  *
- * This function divides audio data from an input stream into multiple output
- * streams based on a crossover filter. It reads the input audio data, applies
- * the crossover filter, and writes the processed audio data to active output
- * streams.
+ * This function reads the interleaved audio data from the source, applies
+ * the crossover split for each channel, and writes the per-band results to
+ * the assigned sinks using the sink circular buffer API.
  *
  * \param cd Pointer to the component data structure which holds the crossover state.
- * \param bsource Pointer to the input stream buffer structure.
- * \param bsinks Array of pointers to output stream buffer structures.
- * \param num_sinks Number of output stream buffers in the bsinks array.
+ * \param source Source handle to read audio data from.
+ * \param sinks Array of sink handles, indexed by band; entries may be NULL.
+ * \param num_sinks Number of entries in the sinks array.
  * \param frames Number of audio frames to process.
+ * \return 0 on success, negative error code otherwise.
  */
-static void crossover_s32_default(struct comp_data *cd,
-				  struct input_stream_buffer *bsource,
-				  struct output_stream_buffer **bsinks,
-				  int32_t num_sinks,
-				  uint32_t frames)
+static int crossover_s32_default(struct comp_data *cd,
+				 struct sof_source *source,
+				 struct sof_sink **sinks,
+				 int32_t num_sinks,
+				 uint32_t frames)
 {
-	/* Array to hold active sink streams; initialized to null */
-	struct audio_stream *sink_stream[SOF_CROSSOVER_MAX_STREAMS] = { NULL };
+	int32_t *y[SOF_CROSSOVER_MAX_STREAMS];
+	int32_t *y_start[SOF_CROSSOVER_MAX_STREAMS];
+	int32_t *y_end[SOF_CROSSOVER_MAX_STREAMS];
+	int out_idx[SOF_CROSSOVER_MAX_STREAMS];
+	int32_t out[SOF_CROSSOVER_MAX_STREAMS];
 	struct crossover_state *state;
-	/* Source stream to read audio data from */
-	const struct audio_stream *source_stream = bsource->data;
-	int32_t *x, *y;
-	int ch, i, j;
-	int idx;
-	/* Counter for active sink streams */
+	int32_t const *x, *x_start, *x_end;
+	int x_samples, y_samples;
+	int nch = source_get_channels(source);
+	size_t bytes = frames * source_get_frame_bytes(source);
 	int active_sinks = 0;
-	/* Number of channels in the source stream */
-	int nch = audio_stream_get_channels(source_stream);
-	/* Output buffer for processed data */
-	int32_t out[num_sinks];
+	int ch, i, j;
+	int ret;
 
-	/* Identify active sinks, avoid processing null sinks later */
+	ret = source_get_data_s32(source, bytes, &x, &x_start, &x_samples);
+	if (ret)
+		return ret;
+	x_end = x_start + x_samples;
+
+	/* Identify active sinks, keeping the band index for correct routing */
 	for (j = 0; j < num_sinks; j++) {
-		if (bsinks[j])
-			sink_stream[active_sinks++] = bsinks[j]->data;
+		if (!sinks[j])
+			continue;
+		ret = sink_get_buffer_s32(sinks[j], bytes, &y[active_sinks],
+					  &y_start[active_sinks], &y_samples);
+		if (ret)
+			return ret;
+		y_end[active_sinks] = y_start[active_sinks] + y_samples;
+		out_idx[active_sinks] = j;
+		active_sinks++;
 	}
 
-	/* Process for each channel */
-	/* Loop through each channel in the source stream */
-	for (ch = 0; ch < nch; ch++) {
-		/* Set current crossover state for this channel */
-		state = &cd->state[ch];
-		/* Iterate over frames */
-		/* Loop through each frame */
-		for (i = 0, idx = ch; i < frames; i++, idx += nch) {
-			/* Read source */
-			/* Read the current audio frame for the channel */
-			x = audio_stream_read_frag_s32(source_stream, idx);
-			/* Apply the crossover split logic to the audio data */
+	/* Frame-major loop keeps sequential access into the circular buffers */
+	for (i = 0; i < frames; i++) {
+		for (ch = 0; ch < nch; ch++) {
+			state = &cd->state[ch];
 			cd->crossover_split(*x, out, state);
-
-			/* Write output to active sinks */
-			/* Write processed output to active sinks */
+			if (++x >= x_end)
+				x = x_start;
 			for (j = 0; j < active_sinks; j++) {
-				/* Write processed data to sink */
-				y = audio_stream_write_frag_s32(sink_stream[j], idx);
-				*y = out[j];
+				*y[j] = out[out_idx[j]];
+				if (++y[j] >= y_end[j])
+					y[j] = y_start[j];
 			}
-
 		}
 	}
+
+	ret = source_release_data(source, bytes);
+	if (ret)
+		return ret;
+	for (j = 0; j < active_sinks; j++) {
+		ret = sink_commit_buffer(sinks[out_idx[j]], bytes);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 #endif /* CONFIG_FORMAT_S32LE */
 
