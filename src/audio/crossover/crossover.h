@@ -19,6 +19,8 @@
 
 struct comp_buffer;
 struct comp_dev;
+struct sof_source;
+struct sof_sink;
 
 /**
  * The Crossover filter will have from 2 to 4 outputs.
@@ -52,11 +54,11 @@ struct comp_dev;
 
 struct comp_data;
 
-typedef void (*crossover_process)(struct comp_data *cd,
-				  struct input_stream_buffer *bsource,
-				  struct output_stream_buffer *bsinks[],
-				  int32_t num_sinks,
-				  uint32_t frames);
+typedef int (*crossover_process)(struct comp_data *cd,
+				 struct sof_source *source,
+				 struct sof_sink **sinks,
+				 int32_t num_sinks,
+				 uint32_t frames);
 
 /* Crossover component private data */
 struct comp_data {
