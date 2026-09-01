@@ -512,9 +512,9 @@ jobs:
           set -x
           for windir in windows-build*; do
             lindir=linux-"${windir#windows-}"
-            diff -qr --exclude="$dir"/build-sof-staging/sof-info/*/stripped-main.elf \
-            diff -qr --exclude="$dir"/build-sof-staging/sof-info/*/stripped-zephyr.elf \
-            diff -qr --exclude="$dir"/build-sof-staging/sof-info/*/zephyr.lst \
+            diff -qr --exclude=build-sof-staging/sof-info/*/stripped-main.elf \
+            diff -qr --exclude=build-sof-staging/sof-info/*/stripped-zephyr.elf \
+            diff -qr --exclude=build-sof-staging/sof-info/*/zephyr.lst \
             "$lindir" "$windir" || : $((diffs++))
           done
           exit $diffs
